@@ -1,7 +1,7 @@
 name: README auto-update (AI)
 
-# Once a day: digest the last 24h of commits with Gemini Flash and let it edit
-# README.md where it thinks the changes matter. Commits the result directly.
+# Dogfood: this repo keeps its own README current using the action it ships.
+# It doubles as a live, copy-pasteable example of how to consume the action.
 
 on:
   schedule:
@@ -9,7 +9,7 @@ on:
   workflow_dispatch: {}        # also run on demand from the Actions tab
 
 permissions:
-  contents: write              # required to push the README change back
+  contents: write              # required so the action can push the README change
 
 concurrency:
   group: readme-auto-update
@@ -22,72 +22,9 @@ jobs:
       - name: Checkout (full history)
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0        # need history to diff the last day
+          fetch-depth: 0        # the action needs history to diff the commit window
 
-      - name: Ask Gemini to update the README
-        env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_MODEL: gemini-2.5-flash   # cheap; gemini-2.5-flash-lite is cheaper
-          SINCE: '1 day ago'               # commit window
-          README_PATH: README.md
-        run: |
-          set -euo pipefail
-
-          if [ -z "${GEMINI_API_KEY:-}" ]; then
-            echo "::error::GEMINI_API_KEY secret is not set."; exit 1
-          fi
-
-          # 1. Gather the last day's commits (skip if there are none)
-          COMMITS="$(git log --since="$SINCE" --no-merges \
-                      --pretty=format:'### %h %s (%an)%n%b' || true)"
-          if [ -z "$COMMITS" ]; then
-            echo "No commits in the last '$SINCE' — nothing to do."; exit 0
-          fi
-          STAT="$(git log --since="$SINCE" --no-merges --stat \
-                   --pretty=format:'%h %s' || true)"
-          PATCH="$(git log --since="$SINCE" --no-merges -p 2>/dev/null | head -c 24000 || true)"
-
-          # 2. Current README
-          if [ -f "$README_PATH" ]; then CURRENT="$(cat "$README_PATH")";
-          else CURRENT="(no README yet — create a concise, accurate starter)"; fi
-
-          # 3. Build the prompt
-          {
-            echo "You maintain the README for a software repository."
-            echo "Below is the CURRENT README, then a digest of the LAST DAY's commits."
-            echo "Return the COMPLETE updated README in raw Markdown. Rules:"
-            echo "- Only change what the commits actually justify (new/changed/removed"
-            echo "  features, usage, flags, config, versions). Do NOT invent anything."
-            echo "- Preserve existing structure, wording, tone, badges and HTML-comment"
-            echo "  markers VERBATIM. Do not reflow or restyle text you are not changing."
-            echo "- If nothing in the commits warrants a change, return the README"
-            echo "  byte-for-byte unchanged."
-            echo "- Output ONLY raw Markdown. No code fences, no commentary."
-            echo; echo "===== CURRENT README ====="; echo "$CURRENT"
-            echo; echo "===== COMMITS (last $SINCE) ====="; echo "$COMMITS"
-            echo; echo "===== FILES CHANGED ====="; echo "$STAT"
-            echo; echo "===== TRUNCATED DIFF ====="; echo "$PATCH"
-          } > prompt.txt
-
-          # 4. Call Gemini (temperature 0 to minimise churn)
-          jq -n --rawfile p prompt.txt \
-            '{contents:[{parts:[{text:$p}]}],generationConfig:{temperature:0}}' > request.json
-          HTTP=$(curl -sS -o resp.json -w '%{http_code}' \
-            "https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent" \
-            -H "x-goog-api-key: ${GEMINI_API_KEY}" \
-            -H 'Content-Type: application/json' -d @request.json)
-          if [ "$HTTP" != "200" ]; then
-            echo "::error::Gemini API returned HTTP $HTTP"; cat resp.json; exit 1
-          fi
-
-          # 5. Extract + strip any accidental ``` fences, write README
-          jq -er '.candidates[0].content.parts[0].text' resp.json > raw.md || {
-            echo "::error::No text in Gemini response"; cat resp.json; exit 1; }
-          sed -e '1{/^```/d}' -e '${/^```$/d}' raw.md > "$README_PATH"
-          echo "Diff:"; git --no-pager diff -- "$README_PATH" || true
-
-      - name: Commit if changed
-        uses: stefanzweifel/git-auto-commit-action@v5
+      - name: Update README
+        uses: ./                 # consumers use: prbe-ai/readme-updater@v1
         with:
-          commit_message: 'docs: auto-update README from last day of commits [skip ci]'
-          file_pattern: README.md
+          gemini-api-key: ${{ secrets.GEMINI_API_KEY }}

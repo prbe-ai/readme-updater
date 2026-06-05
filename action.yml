@@ -1,0 +1,129 @@
+name: 'AI README Updater'
+description: 'Digest recent commits with a cheap LLM (Gemini) and update README.md where it matters.'
+author: 'prbe-ai'
+
+branding:
+  icon: 'book-open'
+  color: 'purple'
+
+inputs:
+  gemini-api-key:
+    description: 'Google Gemini API key. Store it as a repo/org secret and pass it via with:. Never hardcode it.'
+    required: true
+  gemini-model:
+    description: 'Gemini model id. gemini-2.5-flash-lite is cheaper than the default.'
+    required: false
+    default: 'gemini-2.5-flash'
+  since:
+    description: "Commit window passed to git log --since (e.g. '1 day ago', '7 days ago')."
+    required: false
+    default: '1 day ago'
+  readme-path:
+    description: 'Path to the README file to maintain.'
+    required: false
+    default: 'README.md'
+  diff-budget:
+    description: 'Max bytes of truncated diff sent to the model (cost guard).'
+    required: false
+    default: '24000'
+  commit:
+    description: "If 'true', commit and push the change. If 'false', leave it in the working tree for you to handle (e.g. open a PR)."
+    required: false
+    default: 'true'
+  commit-message:
+    description: 'Commit message used when commit is true.'
+    required: false
+    default: 'docs: auto-update README from recent commits [skip ci]'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Generate README update from recent commits
+      shell: bash
+      env:
+        GEMINI_API_KEY: ${{ inputs.gemini-api-key }}
+        GEMINI_MODEL: ${{ inputs.gemini-model }}
+        SINCE: ${{ inputs.since }}
+        README_PATH: ${{ inputs.readme-path }}
+        DIFF_BUDGET: ${{ inputs.diff-budget }}
+      run: |
+        set -euo pipefail
+
+        if [ -z "${GEMINI_API_KEY:-}" ]; then
+          echo "::error::gemini-api-key input is empty. Set the GEMINI_API_KEY secret and pass it via with:."; exit 1
+        fi
+
+        # 1. Gather the commit window (skip cleanly if there is nothing)
+        COMMITS="$(git log --since="$SINCE" --no-merges \
+                    --pretty=format:'### %h %s (%an)%n%b' || true)"
+        if [ -z "$COMMITS" ]; then
+          echo "No commits in the last '$SINCE' — nothing to do."
+          echo "readme-changed=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        STAT="$(git log --since="$SINCE" --no-merges --stat \
+                 --pretty=format:'%h %s' || true)"
+        PATCH="$(git log --since="$SINCE" --no-merges -p 2>/dev/null | head -c "$DIFF_BUDGET" || true)"
+
+        # 2. Current README
+        if [ -f "$README_PATH" ]; then CURRENT="$(cat "$README_PATH")";
+        else CURRENT="(no README yet — create a concise, accurate starter)"; fi
+
+        # 3. Build the prompt
+        {
+          echo "You maintain the README for a software repository."
+          echo "Below is the CURRENT README, then a digest of recent commits."
+          echo "Return the COMPLETE updated README in raw Markdown. Rules:"
+          echo "- Only change what the commits actually justify (new/changed/removed"
+          echo "  features, usage, flags, config, versions). Do NOT invent anything."
+          echo "- Preserve existing structure, wording, tone, badges and HTML-comment"
+          echo "  markers VERBATIM. Do not reflow or restyle text you are not changing."
+          echo "- If nothing in the commits warrants a change, return the README"
+          echo "  byte-for-byte unchanged."
+          echo "- Output ONLY raw Markdown. No code fences, no commentary."
+          echo; echo "===== CURRENT README ====="; echo "$CURRENT"
+          echo; echo "===== COMMITS (last $SINCE) ====="; echo "$COMMITS"
+          echo; echo "===== FILES CHANGED ====="; echo "$STAT"
+          echo; echo "===== TRUNCATED DIFF ====="; echo "$PATCH"
+        } > "$RUNNER_TEMP/prompt.txt"
+
+        # 4. Call Gemini (temperature 0 to minimise churn)
+        jq -n --rawfile p "$RUNNER_TEMP/prompt.txt" \
+          '{contents:[{parts:[{text:$p}]}],generationConfig:{temperature:0}}' > "$RUNNER_TEMP/request.json"
+        HTTP=$(curl -sS -o "$RUNNER_TEMP/resp.json" -w '%{http_code}' \
+          "https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent" \
+          -H "x-goog-api-key: ${GEMINI_API_KEY}" \
+          -H 'Content-Type: application/json' -d @"$RUNNER_TEMP/request.json")
+        if [ "$HTTP" != "200" ]; then
+          echo "::error::Gemini API returned HTTP $HTTP"; cat "$RUNNER_TEMP/resp.json"; exit 1
+        fi
+
+        # 5. Extract, strip any accidental ``` fences, write README
+        jq -er '.candidates[0].content.parts[0].text' "$RUNNER_TEMP/resp.json" > "$RUNNER_TEMP/raw.md" || {
+          echo "::error::No text in Gemini response"; cat "$RUNNER_TEMP/resp.json"; exit 1; }
+        sed -e '1{/^```/d}' -e '${/^```$/d}' "$RUNNER_TEMP/raw.md" > "$README_PATH"
+
+        if git diff --quiet -- "$README_PATH"; then
+          echo "Model returned no changes."
+          echo "readme-changed=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "README updated. Diff:"; git --no-pager diff -- "$README_PATH" || true
+          echo "readme-changed=true" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Commit and push if changed
+      if: ${{ inputs.commit == 'true' }}
+      shell: bash
+      env:
+        README_PATH: ${{ inputs.readme-path }}
+        COMMIT_MESSAGE: ${{ inputs.commit-message }}
+      run: |
+        set -euo pipefail
+        if git diff --quiet -- "$README_PATH"; then
+          echo "No README changes to commit."; exit 0
+        fi
+        git config user.name  "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git add "$README_PATH"
+        git commit -m "$COMMIT_MESSAGE"
+        git push origin "HEAD:${GITHUB_REF_NAME}"

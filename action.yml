@@ -23,9 +23,9 @@ inputs:
     required: false
     default: 'README.md'
   max-turns:
-    description: 'Cap on the agent reasoning/tool-use turns (cost guard).'
+    description: 'Hard ceiling on agent turns — a runaway-loop backstop, NOT a normal-run limit. Real runs finish in ~7-25 turns; the default is set far above that so it only trips on a runaway.'
     required: false
-    default: '20'
+    default: '100'
   commit:
     description: "If 'true', commit and push when README is the sole change. If 'false', leave the edit in the working tree."
     required: false

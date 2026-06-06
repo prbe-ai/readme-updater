@@ -71,7 +71,7 @@ It's a **composite action** — drop ~13 lines into any repo and point at `@v2`.
 | `model` | no | `claude-haiku-4-5` | Cheap by default; bump for harder repos. |
 | `since` | no | `1 day ago` | Investigation window. Match it to your cron. |
 | `readme-path` | no | `README.md` | The **only** file the agent may change. |
-| `max-turns` | no | `20` | Caps agent tool-use turns (cost guard). |
+| `max-turns` | no | `100` | Runaway-loop backstop, not a normal-run limit (real runs finish in ~7-25 turns). |
 | `commit` | no | `true` | `false` leaves the edit in the working tree (e.g. to open a PR yourself). |
 | `commit-message` | no | `docs: auto-update README from recent commits [skip ci]` | Used when committing. |
 
@@ -85,8 +85,10 @@ It's a **composite action** — drop ~13 lines into any repo and point at `@v2`.
 - **Pinned action.** `claude-code-action` is pinned to a full commit SHA per its
   [security advisory](https://www.microsoft.com/en-us/security/blog/2026/06/05/securing-ci-cd-in-agentic-world-claude-code-github-action-case/)
   (an agent reading commit messages is reading attacker-influenceable text).
-- **Cost.** This is an agent loop, not one call — expect cents per run on Haiku.
-  `max-turns` bounds it. For sub-cent runs with no investigation, use `@v1`.
+- **Cost.** This is an agent loop, not one call — expect a few cents per run on Haiku
+  (~$0.04 no-op, ~$0.10-0.16 when it edits; scales with commits in the window).
+  `max-turns` is a runaway-loop ceiling, not a normal-run limit. For sub-cent runs
+  with no investigation, use `@v1`.
 - **No loop:** the push uses the default `GITHUB_TOKEN` (doesn't re-trigger
   workflows) and the commit carries `[skip ci]`.
 

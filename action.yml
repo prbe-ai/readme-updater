@@ -1,5 +1,5 @@
-name: 'AI README Updater'
-description: 'Digest recent commits with a cheap LLM (Gemini) and update README.md where it matters.'
+name: 'AI README Updater (agentic)'
+description: 'A Claude agent investigates recent commits/PRs with git + gh and updates README.md, committing only if the README is the sole change.'
 author: 'prbe-ai'
 
 branding:
@@ -7,123 +7,126 @@ branding:
   color: 'purple'
 
 inputs:
-  gemini-api-key:
-    description: 'Google Gemini API key. Store it as a repo/org secret and pass it via with:. Never hardcode it.'
+  anthropic-api-key:
+    description: 'Anthropic API key. Store it as a repo/org secret and pass via with:. Never hardcode it.'
     required: true
-  gemini-model:
-    description: 'Gemini model id. gemini-2.5-flash-lite is cheaper than the default.'
+  model:
+    description: 'Claude model id. Defaults to a cheap one (Haiku).'
     required: false
-    default: 'gemini-2.5-flash'
+    default: 'claude-haiku-4-5'
   since:
-    description: "Commit window passed to git log --since (e.g. '1 day ago', '7 days ago')."
+    description: "Investigation window the agent is told to look back over (e.g. '1 day ago', '7 days ago')."
     required: false
     default: '1 day ago'
   readme-path:
-    description: 'Path to the README file to maintain.'
+    description: 'Path to the README file to maintain. The agent may change ONLY this file.'
     required: false
     default: 'README.md'
-  diff-budget:
-    description: 'Max bytes of truncated diff sent to the model (cost guard).'
+  max-turns:
+    description: 'Cap on the agent reasoning/tool-use turns (cost guard).'
     required: false
-    default: '24000'
+    default: '20'
   commit:
-    description: "If 'true', commit and push the change. If 'false', leave it in the working tree for you to handle (e.g. open a PR)."
+    description: "If 'true', commit and push when README is the sole change. If 'false', leave the edit in the working tree."
     required: false
     default: 'true'
   commit-message:
-    description: 'Commit message used when commit is true.'
+    description: 'Commit message used when committing.'
     required: false
     default: 'docs: auto-update README from recent commits [skip ci]'
 
 runs:
   using: 'composite'
   steps:
-    - name: Generate README update from recent commits
+    - name: Record base commit
       shell: bash
-      env:
-        GEMINI_API_KEY: ${{ inputs.gemini-api-key }}
-        GEMINI_MODEL: ${{ inputs.gemini-model }}
-        SINCE: ${{ inputs.since }}
-        README_PATH: ${{ inputs.readme-path }}
-        DIFF_BUDGET: ${{ inputs.diff-budget }}
-      run: |
-        set -euo pipefail
+      run: echo "RU_BASE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
 
-        if [ -z "${GEMINI_API_KEY:-}" ]; then
-          echo "::error::gemini-api-key input is empty. Set the GEMINI_API_KEY secret and pass it via with:."; exit 1
-        fi
+    - name: Investigate changes and edit the README
+      # Pinned to a full SHA (resolves to v1) per the claude-code-action security advisory:
+      # don't trust a moving tag for an agent that reads attacker-influenceable commit text.
+      uses: anthropics/claude-code-action@64de744025ca9e24df2b88204b4f1e968f39f009
+      with:
+        anthropic_api_key: ${{ inputs.anthropic-api-key }}
+        github_token: ${{ github.token }}
+        prompt: |
+          You maintain the README for this repository. Investigate what changed in
+          roughly the last "${{ inputs.since }}" and update ${{ inputs.readme-path }}
+          ONLY where it materially matters to users.
 
-        # 1. Gather the commit window (skip cleanly if there is nothing)
-        COMMITS="$(git log --since="$SINCE" --no-merges \
-                    --pretty=format:'### %h %s (%an)%n%b' || true)"
-        if [ -z "$COMMITS" ]; then
-          echo "No commits in the last '$SINCE' — nothing to do."
-          echo "readme-changed=false" >> "$GITHUB_OUTPUT"
-          exit 0
-        fi
-        STAT="$(git log --since="$SINCE" --no-merges --stat \
-                 --pretty=format:'%h %s' || true)"
-        PATCH="$(git log --since="$SINCE" --no-merges -p 2>/dev/null | head -c "$DIFF_BUDGET" || true)"
+          Investigate (read-only) before writing anything:
+          - Run: git log --since="${{ inputs.since }}" --no-merges --stat
+            then git show <sha> / git diff on the commits that look user-facing.
+          - Use: gh pr list --state merged --limit 30  and  gh pr view <n>
+            to understand the intent behind merged PRs; gh issue view <n> for any
+            referenced issue.
+          - Open the touched source files with Read to confirm the REAL behavior.
+            Never trust a commit message alone.
 
-        # 2. Current README
-        if [ -f "$README_PATH" ]; then CURRENT="$(cat "$README_PATH")";
-        else CURRENT="(no README yet — create a concise, accurate starter)"; fi
+          Then edit ${{ inputs.readme-path }} to match reality:
+          - Only change what the work actually justifies (features, usage, flags,
+            config, install, behavior changes, removals, versions). Invent nothing.
+          - Preserve the existing structure, tone, badges and HTML-comment markers
+            verbatim; do not reflow text you are not changing.
+          - If nothing in the window warrants a change, make NO edits.
 
-        # 3. Build the prompt
-        {
-          echo "You maintain the README for a software repository."
-          echo "Below is the CURRENT README, then a digest of recent commits."
-          echo "Return the COMPLETE updated README in raw Markdown. Rules:"
-          echo "- Only change what the commits actually justify (new/changed/removed"
-          echo "  features, usage, flags, config, versions). Do NOT invent anything."
-          echo "- Preserve existing structure, wording, tone, badges and HTML-comment"
-          echo "  markers VERBATIM. Do not reflow or restyle text you are not changing."
-          echo "- If nothing in the commits warrants a change, return the README"
-          echo "  byte-for-byte unchanged."
-          echo "- Output ONLY raw Markdown. No code fences, no commentary."
-          echo; echo "===== CURRENT README ====="; echo "$CURRENT"
-          echo; echo "===== COMMITS (last $SINCE) ====="; echo "$COMMITS"
-          echo; echo "===== FILES CHANGED ====="; echo "$STAT"
-          echo; echo "===== TRUNCATED DIFF ====="; echo "$PATCH"
-        } > "$RUNNER_TEMP/prompt.txt"
+          HARD RULES (a later step enforces these and will revert violations):
+          - Edit ONLY ${{ inputs.readme-path }}. Do not modify, create, or delete any
+            other file.
+          - Do NOT commit, push, or open a pull request. Leave your edit in the
+            working tree; a later step decides whether to commit.
+        claude_args: |
+          --model ${{ inputs.model }}
+          --max-turns ${{ inputs.max-turns }}
+          --allowedTools "Read,Edit,Bash(git log:*),Bash(git show:*),Bash(git diff:*),Bash(git status:*),Bash(gh pr list:*),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh issue list:*),Bash(gh issue view:*),Bash(gh search:*),Bash(gh api:*)"
 
-        # 4. Call Gemini (temperature 0 to minimise churn)
-        jq -n --rawfile p "$RUNNER_TEMP/prompt.txt" \
-          '{contents:[{parts:[{text:$p}]}],generationConfig:{temperature:0}}' > "$RUNNER_TEMP/request.json"
-        HTTP=$(curl -sS -o "$RUNNER_TEMP/resp.json" -w '%{http_code}' \
-          "https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent" \
-          -H "x-goog-api-key: ${GEMINI_API_KEY}" \
-          -H 'Content-Type: application/json' -d @"$RUNNER_TEMP/request.json")
-        if [ "$HTTP" != "200" ]; then
-          echo "::error::Gemini API returned HTTP $HTTP"; cat "$RUNNER_TEMP/resp.json"; exit 1
-        fi
-
-        # 5. Extract, strip any accidental ``` fences, write README
-        jq -er '.candidates[0].content.parts[0].text' "$RUNNER_TEMP/resp.json" > "$RUNNER_TEMP/raw.md" || {
-          echo "::error::No text in Gemini response"; cat "$RUNNER_TEMP/resp.json"; exit 1; }
-        sed -e '1{/^```/d}' -e '${/^```$/d}' "$RUNNER_TEMP/raw.md" > "$README_PATH"
-
-        if git diff --quiet -- "$README_PATH"; then
-          echo "Model returned no changes."
-          echo "readme-changed=false" >> "$GITHUB_OUTPUT"
-        else
-          echo "README updated. Diff:"; git --no-pager diff -- "$README_PATH" || true
-          echo "readme-changed=true" >> "$GITHUB_OUTPUT"
-        fi
-
-    - name: Commit and push if changed
-      if: ${{ inputs.commit == 'true' }}
+    - name: Commit only if the README is the sole change
       shell: bash
       env:
         README_PATH: ${{ inputs.readme-path }}
         COMMIT_MESSAGE: ${{ inputs.commit-message }}
+        DO_COMMIT: ${{ inputs.commit }}
       run: |
         set -euo pipefail
-        if git diff --quiet -- "$README_PATH"; then
-          echo "No README changes to commit."; exit 0
+        BASE="${RU_BASE_SHA:-$(git rev-parse HEAD)}"
+
+        # Union of uncommitted edits and any commits the agent may have made since BASE.
+        UNCOMMITTED="$(git status --porcelain | sed -E 's/^...//; s/.* -> //')"
+        COMMITTED="$(git diff --name-only "$BASE" HEAD)"
+        CHANGED="$(printf '%s\n%s\n' "$UNCOMMITTED" "$COMMITTED" | sed '/^$/d' | sort -u)"
+
+        if [ -z "$CHANGED" ]; then
+          echo "No changes — nothing to commit."; exit 0
         fi
+        echo "Changed paths:"; echo "$CHANGED"
+
+        # ENFORCE: README must be the ONLY changed path, else revert and fail.
+        OTHER="$(printf '%s\n' "$CHANGED" | grep -vxF "$README_PATH" || true)"
+        if [ -n "$OTHER" ]; then
+          echo "::error::Agent touched files other than $README_PATH — refusing to commit:"
+          printf '%s\n' "$OTHER"
+          git reset --hard "$BASE"
+          exit 1
+        fi
+
+        if [ "$DO_COMMIT" != "true" ]; then
+          echo "commit=false — leaving the README edit in the working tree."; exit 0
+        fi
+
+        # Collapse any agent commits back to BASE, keeping the README change staged.
+        git reset --soft "$BASE"
         git config user.name  "github-actions[bot]"
         git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-        git add "$README_PATH"
+        git add -- "$README_PATH"
+
+        EXTRA="$(git diff --cached --name-only | grep -vxF "$README_PATH" || true)"
+        if [ -n "$EXTRA" ]; then
+          echo "::error::Unexpected staged files after normalize: $EXTRA"; git reset --hard "$BASE"; exit 1
+        fi
+        if git diff --cached --quiet; then
+          echo "Nothing staged — no README change to commit."; exit 0
+        fi
+
         git commit -m "$COMMIT_MESSAGE"
         git push origin "HEAD:${GITHUB_REF_NAME}"
+        echo "Committed README update."

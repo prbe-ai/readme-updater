@@ -9,7 +9,9 @@ on:
   workflow_dispatch: {}        # also run on demand from the Actions tab
 
 permissions:
-  contents: write              # required so the action can push the README change
+  contents: write              # so the action can push the README change
+  pull-requests: read          # so the agent can crawl merged PRs via gh
+  issues: read                 # so the agent can crawl referenced issues via gh
 
 concurrency:
   group: readme-auto-update
@@ -22,9 +24,9 @@ jobs:
       - name: Checkout (full history)
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0        # the action needs history to diff the commit window
+          fetch-depth: 0        # the agent needs history to investigate the window
 
       - name: Update README
-        uses: ./                 # consumers use: prbe-ai/readme-updater@v1
+        uses: ./                 # consumers use: prbe-ai/readme-updater@v2
         with:
-          gemini-api-key: ${{ secrets.GEMINI_API_KEY }}
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
